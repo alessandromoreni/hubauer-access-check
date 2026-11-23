@@ -1,9 +1,13 @@
 name: Hubauer access check
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/hubauer-access.yml]
 permissions: {}
 jobs:
   check:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'Fix robots group selection for Hubauer access check'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
@@ -45,27 +49,53 @@ jobs:
           if kind != "text/plain" or len(data) > 512_000:
               raise SystemExit("Stopped: robots.txt was not available as a complete plain-text file")
           path = urlsplit(model).path
-          delay = 1.1
-          has_group = False
+          groups = []
+          names = []
+          rules = []
+          started_rules = False
           for line in data.decode("utf-8-sig").splitlines():
               key, _, value = line.split("#", 1)[0].partition(":")
               key, value = key.strip().lower(), value.strip()
-              has_group |= key == "user-agent" and bool(value)
-              if key == "disallow" and value:
-                  # Honor matching restrictions even if they apply to a different crawler.
+              if key == "user-agent" and value:
+                  if started_rules:
+                      groups.append((names, rules))
+                      names, rules = [], []
+                      started_rules = False
+                  names.append(value.lower())
+              elif names and key in {"allow", "disallow", "crawl-delay", "request-rate", "visit-time"}:
+                  rules.append((key, value))
+                  started_rules = True
+          if names:
+              groups.append((names, rules))
+
+          product = agent.split("/", 1)[0].lower()
+          applicable = [rules for names, rules in groups if product in names]
+          if not applicable:
+              applicable = [rules for names, rules in groups if "*" in names]
+          if not applicable:
+              raise SystemExit("Stopped: no applicable robots.txt group could be verified")
+
+          matches = []
+          for rules in applicable:
+              for key, value in rules:
+                  if key not in {"allow", "disallow"}:
+                      raise SystemExit("Stopped: crawl schedule requires manual review")
+                  if not value:
+                      continue
                   if "%" in value or not value.isascii() or not value.startswith("/"):
-                      raise SystemExit("Stopped: robots.txt contains a rule requiring manual review")
+                      raise SystemExit("Stopped: path rule requires manual review")
                   pattern = re.escape(value.removesuffix("$")).replace(r"\*", ".*")
-                  if re.match(pattern + ("$" if value.endswith("$") else ""), path):
-                      raise SystemExit("Stopped: a robots.txt rule matches the model page")
-              if key in {"crawl-delay", "request-rate", "visit-time"}:
-                  raise SystemExit("Stopped: robots.txt defines a crawl schedule requiring manual review")
-          if not has_group:
-              raise SystemExit("Stopped: robots.txt has no verifiable user-agent group")
-          time.sleep(delay)
+                  if re.match(pattern + (r"\Z" if value.endswith("$") else ""), path):
+                      matches.append((len(value), key == "allow"))
+          if matches and not max(matches)[1]:
+              raise SystemExit("Stopped: robots.txt disallows the model page")
+          print("robots.txt: applicable rules permit the model page", flush=True)
+          time.sleep(1.1)
           kind, data = fetch(model, "F70 model page", 2_000_000)
           if kind != "text/html" or len(data) > 2_000_000:
               raise SystemExit("Stopped: the model response was not complete HTML")
           # Record only whether the public identifiers occur, never the page contents.
-          print("Model identifiers in HTML:", all(token in data.upper() for token in (b"32GE", b"F70")))
+          print("Model identifiers found:", sum(token in data.upper() for token in (b"31GE", b"32GE")))
+          if not all(token in data.upper() for token in (b"32GE", b"F70")):
+              raise SystemExit("Stopped: expected F70 model markers not found")
           PY
