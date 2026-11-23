@@ -1,0 +1,44 @@
+name: RealOEM robots diagnostic
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/realoem-robots-diagnostic.yml]
+permissions: {}
+jobs:
+  diagnostic:
+    if: github.event.head_commit.message == 'Diagnose RealOEM robots response once'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Record the response to one robots request
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          from html import unescape
+          from urllib.error import HTTPError
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          url = "https://www.realoem.com/robots.txt"
+          agent = "OilStationCatalogPilot/1.0 (+https://github.com/alessandromoreni/hubauer-access-check)"
+          try:
+              response = build_opener(NoRedirect()).open(Request(url, headers={"User-Agent": agent}), timeout=15)
+          except HTTPError as error:
+              response = error
+          with response:
+              print(f"HTTP {response.code}")
+              for name in ("Server", "CF-Ray", "cf-mitigated", "Content-Type", "Retry-After"):
+                  value = response.headers.get(name, "(absent)")
+                  print(f"{name}: {value[:200]!r}")
+              if response.code >= 400:
+                  data = response.read(8192).decode("utf-8", errors="replace")
+                  title = re.search(r"<title\b[^>]*>(.*?)</title>", data, re.I | re.S)
+                  if title:
+                      print("Error title:", " ".join(unescape(title[1]).split())[:150].__repr__())
+                  codes = re.findall(r"\b(?:error\s+(?:code\s*[: ]\s*)?)(10\d{2})\b", data, re.I)
+                  print("Explicit edge error codes:", sorted(set(codes)))
+          PY
