@@ -1,0 +1,71 @@
+name: Hubauer access check
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check robots and one public model page
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          origin = "https://www.hubauer-shop.de"
+          model = origin + "/it/carparts/1er-parts/1-5-t/32ge-f70-b38l/116-5-tuerer-f70-motor-32ge/"
+          agent = "HubauerAccessCheck/1.0 (+https://github.com/alessandromoreni/hubauer-access-check)"
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          opener = build_opener(NoRedirect())
+
+          def fetch(url, label, max_bytes):
+              try:
+                  with opener.open(Request(url, headers={"User-Agent": agent}), timeout=20) as response:
+                      print(f"{label}: HTTP {response.status}", flush=True)
+                      return response.headers.get_content_type(), response.read(max_bytes + 1)
+              except HTTPError as error:
+                  print(f"{label}: HTTP {error.code}", flush=True)
+                  retry_after = error.headers.get("Retry-After", "")
+                  if re.fullmatch(r"[A-Za-z0-9 :,+-]{1,64}", retry_after):
+                      print(f"Retry-After: {retry_after}")
+                  raise SystemExit(1)
+              except (URLError, TimeoutError):
+                  raise SystemExit(f"{label}: connection failed")
+
+          kind, data = fetch(origin + "/robots.txt", "robots.txt", 512_000)
+          if kind != "text/plain" or len(data) > 512_000:
+              raise SystemExit("Stopped: robots.txt was not available as a complete plain-text file")
+          path = urlsplit(model).path
+          delay = 1.1
+          has_group = False
+          for line in data.decode("utf-8-sig").splitlines():
+              key, _, value = line.split("#", 1)[0].partition(":")
+              key, value = key.strip().lower(), value.strip()
+              has_group |= key == "user-agent" and bool(value)
+              if key == "disallow" and value:
+                  # Honor matching restrictions even if they apply to a different crawler.
+                  if "%" in value or not value.isascii() or not value.startswith("/"):
+                      raise SystemExit("Stopped: robots.txt contains a rule requiring manual review")
+                  pattern = re.escape(value.removesuffix("$")).replace(r"\*", ".*")
+                  if re.match(pattern + ("$" if value.endswith("$") else ""), path):
+                      raise SystemExit("Stopped: a robots.txt rule matches the model page")
+              if key in {"crawl-delay", "request-rate", "visit-time"}:
+                  raise SystemExit("Stopped: robots.txt defines a crawl schedule requiring manual review")
+          if not has_group:
+              raise SystemExit("Stopped: robots.txt has no verifiable user-agent group")
+          time.sleep(delay)
+          kind, data = fetch(model, "F70 model page", 2_000_000)
+          if kind != "text/html" or len(data) > 2_000_000:
+              raise SystemExit("Stopped: the model response was not complete HTML")
+          # Record only whether the public identifiers occur, never the page contents.
+          print("Model identifiers in HTML:", all(token in data.upper() for token in (b"32GE", b"F70")))
+          PY
